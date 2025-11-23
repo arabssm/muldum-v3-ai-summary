@@ -1,817 +1,1211 @@
-import asyncio
-import logging
+import json
 import os
-import tempfile
-import threading
-import time
-import uuid
-from enum import Enum
-from pathlib import Path
-from typing import List, Optional
-
-import torch
-import torch.nn.functional as F
 import re
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import uuid
+import shutil
+import tempfile
+import subprocess
+from urllib.parse import quote_plus, urljoin, urlparse, parse_qs
+import requests
+from typing import Dict, Any, List, Optional, Union
+from urllib.parse import unquote
+
+from bs4 import BeautifulSoup
+import json as _json_unescape  # for decoding escaped strings in JSON blobs
+import xml.etree.ElementTree as ET
+import torchaudio
+# pyannote 3.3.x AudioDecoder 이름 오류 방어용 + torchcodec 미설치 대비
+try:
+    from pyannote.audio.core.io import AudioDecoder  # type: ignore
+except Exception:
+    AudioDecoder = None  # type: ignore
+try:
+    import pyannote.audio.core.io as _pyannote_io  # type: ignore
+except Exception:
+    _pyannote_io = None
+if _pyannote_io is not None and getattr(_pyannote_io, "AudioDecoder", None) is None:
+    import torch
+
+    class _FallbackAudioStreamMetadata:
+        def __init__(self, sample_rate: int, num_frames: int, num_channels: int):
+            self.sample_rate = sample_rate
+            self.num_frames = num_frames
+            self.num_channels = num_channels
+            self.duration_seconds_from_header = num_frames / sample_rate if sample_rate else 0.0
+
+    class _FallbackAudioSamples:
+        def __init__(self, data: torch.Tensor, sample_rate: int):
+            self.data = data
+            self.sample_rate = sample_rate
+
+    class _FallbackAudioDecoder:
+        def __init__(self, source):
+            self.source = source
+            import soundfile as sf
+            import numpy as np
+
+            data, sr = sf.read(source, always_2d=True)
+            # soundfile returns [frames, channels]; convert to [channel, time]
+            data = np.asarray(data, dtype="float32").T
+            waveform = torch.from_numpy(data)
+            self._waveform = waveform
+            self._sr = sr
+            self.metadata = _FallbackAudioStreamMetadata(sr, waveform.shape[1], waveform.shape[0])
+
+        def get_all_samples(self):
+            return _FallbackAudioSamples(self._waveform, self._sr)
+
+        def get_samples_played_in_range(self, start: float, end: float):
+            start_frame = int(max(0, start * self._sr))
+            end_frame = int(min(self._waveform.shape[1], end * self._sr))
+            data = self._waveform[:, start_frame:end_frame]
+            return _FallbackAudioSamples(data, self._sr)
+
+    _pyannote_io.AudioDecoder = _FallbackAudioDecoder  # type: ignore
+    _pyannote_io.AudioStreamMetadata = _FallbackAudioStreamMetadata  # type: ignore
+    _pyannote_io.AudioSamples = _FallbackAudioSamples  # type: ignore
+    AudioDecoder = _FallbackAudioDecoder  # type: ignore
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from transformers import BartForConditionalGeneration, PreTrainedTokenizerFast
+from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+from pyannote.audio import Pipeline
+from pyannote.audio.core.model import Model
+from faster_whisper import WhisperModel
+from summa.summarizer import summarize
 
+# =========================
+# 환경 변수 / 전역 설정
+# =========================
 
-class ProviderType(str, Enum):
-    google = "google"
-    aws = "aws"
-    azure = "azure"
-    whisper = "whisper"
+load_dotenv()
 
+# 일부 배포 환경에서는 torchaudio에 list_audio_backends가 없어 speechbrain 초기화가 실패하므로 방어적으로 추가
+if not hasattr(torchaudio, "list_audio_backends"):
+    torchaudio.list_audio_backends = lambda: []
 
-class SpeakerSegment(BaseModel):
-    speaker: str
-    text: str
-    start: Optional[float] = None
-    end: Optional[float] = None
-
-
-class SummaryRequest(BaseModel):
-    text: Optional[str] = None
-    segments: Optional[List[SpeakerSegment]] = None
+# pyannote 내부에서 Model.from_pretrained에 'repo@rev' 문자열을 바로 넘기는 경우가 있어
+# revision 인자를 자동 분리하도록 monkey patch
+_orig_model_from_pretrained = Model.from_pretrained
 
 
-class SummaryResponse(BaseModel):
-    summary: str
+def _patched_model_from_pretrained(checkpoint, *args, revision=None, **kwargs):
+    if isinstance(checkpoint, str) and "@" in checkpoint and revision is None:
+        base, rev = checkpoint.split("@", 1)
+        return _orig_model_from_pretrained(base, *args, revision=rev, **kwargs)
+    return _orig_model_from_pretrained(checkpoint, *args, revision=revision, **kwargs)
 
 
-def extract_word_units(whisper_result: dict) -> List[dict]:
-    """Flatten Whisper output into time-aligned word units."""
-    words: List[dict] = []
-    for segment in whisper_result.get("segments", []):
-        segment_start = float(segment.get("start", 0.0))
-        segment_end = float(segment.get("end", segment_start))
-        segment_words = segment.get("words") or []
-        if segment_words:
-            for word in segment_words:
-                text = (word.get("word") or word.get("text") or "").strip()
-                if not text:
-                    continue
-                start = float(word.get("start", segment_start))
-                end = float(word.get("end", segment_end))
-                words.append({"text": text, "start": start, "end": end})
-        else:
-            text = segment.get("text", "").strip()
-            if text:
-                words.append({"text": text, "start": segment_start, "end": segment_end})
-    return words
+Model.from_pretrained = staticmethod(_patched_model_from_pretrained)  # type: ignore[assignment]
 
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
+if HF_TOKEN is None:
+    raise RuntimeError("HUGGINGFACE_TOKEN 환경 변수를 설정해주세요.")
 
-def build_segments_from_intervals(words: List[dict], intervals: List[tuple]) -> List[SpeakerSegment]:
-    segments: List[SpeakerSegment] = []
-    for speaker, start, end in intervals:
-        tokens = [
-            w["text"]
-            for w in words
-            if not (w["end"] < start or w["start"] > end)
-        ]
-        text = " ".join(tokens).strip()
-        if text:
-            segments.append(SpeakerSegment(speaker=str(speaker), text=text, start=start, end=end))
-    return segments
+def _parse_model_id_and_revision(model_id: str) -> tuple[str, Optional[str]]:
+    """환경 변수에 'repo@rev' 형태가 들어오면 revision으로 분리."""
+    if "@" in model_id:
+        base, revision = model_id.split("@", 1)
+        return base, revision
+    return model_id, None
 
+PYANNOTE_MODEL_ID_RAW = os.getenv(
+    "PYANNOTE_MODEL_ID",
+    "pyannote/speaker-diarization"  # 필요하면 다른 모델 ID로 바꿔도 됨
+)
+PYANNOTE_MODEL_ID, PYANNOTE_MODEL_REVISION = _parse_model_id_and_revision(PYANNOTE_MODEL_ID_RAW)
 
-class TranscriptionResponse(BaseModel):
-    provider: ProviderType
-    segments: List[SpeakerSegment]
-    summary: str
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "medium")  # tiny/small/medium/large 등
+USE_GPU = os.getenv("USE_GPU", "false").lower() == "true"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# 기본값을 v1 API용 최신 플래시로 설정 (환경 변수로 덮어쓰기 가능)
+GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
+# 기본 API 버전 (권장 v1, 필요 시 v1beta)
+GEMINI_API_VERSION = os.getenv("GEMINI_API_VERSION", "v1")
 
+# =========================
+# 모델 로딩 (서버 시작 시 1회)
+# =========================
 
-app = FastAPI()
-
-allowed_origins_env = os.environ.get("CORS_ALLOW_ORIGINS")
-allowed_origins = (
-    [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
-    if allowed_origins_env
-    else ["*"]
+print("Loading pyannote pipeline...")
+diarization_pipeline = Pipeline.from_pretrained(
+    PYANNOTE_MODEL_ID,
+    token=HF_TOKEN,
+    revision=PYANNOTE_MODEL_REVISION
 )
 
+print("Loading Whisper model...")
+whisper_model = WhisperModel(
+    WHISPER_MODEL_SIZE,
+    device="cuda" if USE_GPU else "cpu",
+    compute_type="int8"  # 속도/메모리 절약용
+)
+
+app = FastAPI(title="Meeting Summarizer API", version="0.1.0")
+
+# CORS 설정
+origins = [
+    "http://localhost:3000",
+    "https://v2.muldum.com",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-tokenizer = PreTrainedTokenizerFast.from_pretrained("gogamza/kobart-summarization")
-model = BartForConditionalGeneration.from_pretrained("gogamza/kobart-summarization")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
-model.eval()
+# =========================
+# Gemini 쇼핑 추천 프롬프트 구성
+# =========================
+
+GEMINI_SYSTEM_PROMPT = (
+    "너는 DeviceMart/11번가 가격 비교를 돕는 쇼핑 어시스턴트다. "
+    "무료배송 상품을 최우선으로, 같은 조건이라면 더 저렴한 상품을 추천한다. "
+    "지정된 JSON 외의 말은 절대 하지 않는다."
+)
+
+GEMINI_RESPONSE_SCHEMA_EXAMPLE = {
+    "summary": "거절 사유를 어떻게 개선했는지 1-2문장",
+    "recommendations": [
+        {
+            "itemId": 123,
+            "productName": "상품명",
+            "source": "DeviceMart | 11번가",
+            "price": 19000,
+            "deliveryPrice": "무료배송 or 2000",
+            "estimatedDelivery": "2025-02-03",
+            "productUrl": "https://...",
+            "imageUrl": "https://...",
+            "reason": "가격/배송/거절사유 개선 포인트 한 줄"
+        }
+    ]
+}
 
 
-def encode_text(text: str, max_length: int):
-    """Tokenize text for KoBART without token_type_ids."""
-    return tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_length,
-        padding="max_length",
-        return_token_type_ids=False,
-    ).to(device)
+class BaseItem(BaseModel):
+    id: int
+    product_name: str = Field(..., alias="productName")
+    price: int
+    link: str
+    # teamId가 숫자/문자 모두 들어오는 상황을 허용
+    team_id: Optional[Union[str, int]] = Field(None, alias="teamId")
+    reject_reason: Optional[str] = Field(None, alias="rejectReason")
+
+    class Config:
+        allow_population_by_field_name = True
 
 
-def is_repetitive(text: str, min_tokens: int = 10, ratio_threshold: float = 0.3) -> bool:
-    """Return True if the text mostly repeats the same tokens."""
-    tokens = text.split()
-    if len(tokens) < min_tokens:
-        return False
-    return (len(set(tokens)) / len(tokens)) < ratio_threshold
+class CandidateItem(BaseModel):
+    item_id: int = Field(..., alias="itemId")
+    product_name: str = Field(..., alias="productName")
+    price: int
+    delivery_price: Optional[str] = Field(None, alias="deliveryPrice")
+    delivery_time: Optional[str] = Field(None, alias="deliveryTime")
+    link: Optional[str] = None
+    image_url: Optional[str] = Field(None, alias="imageUrl")
+    recent_registered_at: Optional[str] = Field(None, alias="recentRegisteredAt")
+    same_team: Optional[bool] = Field(None, alias="sameTeam")
+    source: Optional[str] = Field(None, description="DeviceMart 또는 11번가")
+
+    class Config:
+        allow_population_by_field_name = True
 
 
-def collapse_repetitions(text: str, max_repeat: int = 1) -> str:
-    """Limit consecutive duplicate tokens to reduce degenerate summaries."""
-    tokens = re.split(r"(\s+)", text)
-    result = []
-    prev = None
-    repeat = 0
-    for token in tokens:
-        if token.isspace():
-            result.append(token)
+class RecommendationRequest(BaseModel):
+    base_item: BaseItem = Field(..., alias="baseItem")
+    candidates: List[CandidateItem] = Field(default_factory=list)
+
+    class Config:
+        allow_population_by_field_name = True
+
+
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    """pydantic v1/v2 호환용 dict 추출"""
+    if hasattr(model, "model_dump"):
+        return model.model_dump(by_alias=True, exclude_none=True)  # type: ignore[attr-defined]
+    return model.dict(by_alias=True, exclude_none=True)
+
+
+def build_recommendation_prompt(
+    base_item: BaseItem,
+    candidates: List[CandidateItem]
+) -> Dict[str, Any]:
+    """
+    Gemini에 전달할 system/user 프롬프트와 응답 스키마 예시를 구성한다.
+    """
+    # 기준 상품과 동일한 ID/이름은 후보에서 제외
+    candidate_payload = []
+    for c in candidates:
+        if c.item_id == base_item.id:
             continue
-        norm = token.strip()
-        if not norm:
-            result.append(token)
+        if c.product_name.strip() == base_item.product_name.strip():
             continue
-        if prev and norm == prev:
-            repeat += 1
-            if repeat < max_repeat:
-                result.append(token)
-        else:
-            prev = norm
-            repeat = 0
-            result.append(token)
-    return "".join(result)
+        candidate_payload.append(_model_dump(c))
+
+    reject_reason = base_item.reject_reason or "없음"
+    base_link = base_item.link or "없음"
+    has_candidates = len(candidate_payload) > 0
+
+    if has_candidates:
+        user_prompt = (
+            "기준 상품:\n"
+            f"- 이름: {base_item.product_name}\n"
+            f"- 가격: {base_item.price}\n"
+            f"- 링크: {base_link}\n"
+            f"- 팀ID: {base_item.team_id or '미지정'}\n"
+            f"- 거절 사유: {reject_reason}\n\n"
+            "후보 목록(JSON 배열):\n"
+            f"{json.dumps(candidate_payload, ensure_ascii=False, indent=2)}\n\n"
+            "요청:\n"
+            "- 기준 상품과 동일한 이름/ID의 후보는 추천에서 제외.\n"
+            "- 각 추천은 productUrl(후보의 link)과 imageUrl(후보의 imageUrl)을 반드시 포함. 없으면 해당 후보는 제외하거나 합리적인 값으로 채워.\n"
+            "1) 무료배송이 아닌 후보는 제외하고 최대 3개만 추천. 단, 모두 유료배송이면 그 사실을 명시하고 최저가 순으로 3개 추천.\n"
+            "2) 각 추천마다 (가격, 배송비, 추천 이유)을 한 줄 요약으로 설명.\n"
+            f"3) 거절 사유({reject_reason})를 해결/개선하는 후보만 고른다.\n"
+            "4) JSON으로만 답하고, 다음 스키마를 따른다."
+        )
+    else:
+        user_prompt = (
+            "기준 상품:\n"
+            f"- 이름: {base_item.product_name}\n"
+            f"- 가격: {base_item.price}\n"
+            f"- 링크: {base_link}\n"
+            f"- 팀ID: {base_item.team_id or '미지정'}\n"
+            f"- 거절 사유: {reject_reason}\n\n"
+            "후보 목록이 제공되지 않았습니다.\n\n"
+            "요청:\n"
+            "- 기준 상품과 동일한 이름/ID는 절대 추천하지 말 것.\n"
+            "- productUrl, imageUrl을 합리적인 값(예: https://example.com/item/..., https://example.com/img/...)으로 채워서 최대 3개 제안.\n"
+            "1) 기준 상품과 거절 사유를 참고하여 조건을 만족하는 대체 상품을 최대 3개 생성해서 추천.\n"
+            "2) 무료배송을 우선, 없으면 유료배송이라도 최저가 순으로 제안.\n"
+            "3) 가격/배송비/도착예상일/링크/이미지를 합리적 값으로 채워 넣되, 거절 사유를 해결하도록 선택.\n"
+            "4) JSON으로만 답하고, 다음 스키마를 따른다."
+        )
+
+    return {
+        "system_prompt": GEMINI_SYSTEM_PROMPT,
+        "user_prompt": user_prompt,
+        "response_schema_example": GEMINI_RESPONSE_SCHEMA_EXAMPLE,
+    }
 
 
-def deduplicate_sentences(text: str, min_chars: int = 5) -> str:
-    """Remove duplicate sentences while preserving order."""
-    stripped = text.strip()
-    if not stripped:
-        return stripped
+def call_gemini(system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+    """
+    Gemini REST API 호출. 성공 시 원문과 파싱된 JSON(가능하면)을 반환한다.
+    """
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY 환경 변수를 설정해주세요.")
 
-    parts = re.split(r"(?<=[.!?])\s+|\n+", stripped)
+    def _do_call(version: str):
+        url = f"https://generativelanguage.googleapis.com/{version}/models/{GEMINI_MODEL_ID}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": f"{system_prompt}\n\n{user_prompt}"}
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.3,
+            },
+        }
+        try:
+            return requests.post(url, json=payload, timeout=60)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Gemini 호출 실패: {e}")
+
+    # 우선 설정된 버전으로 호출, 404면 v1<->v1beta 교차 재시도
+    resp = _do_call(GEMINI_API_VERSION)
+    if resp.status_code == 404 and GEMINI_API_VERSION == "v1beta":
+        resp = _do_call("v1")
+    elif resp.status_code == 404 and GEMINI_API_VERSION == "v1":
+        resp = _do_call("v1beta")
+
+    if resp.status_code != 200:
+        if resp.status_code == 429:
+            raise HTTPException(status_code=429, detail="Gemini 호출이 과도합니다. 잠시 후 다시 시도하세요.")
+        raise HTTPException(status_code=resp.status_code, detail=f"Gemini 오류: {resp.text}")
+
+    data = resp.json()
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        raise HTTPException(status_code=502, detail="Gemini 응답 파싱 실패")
+
+    parsed_json: Optional[Dict[str, Any]] = None
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        # ```json ... ``` 형태 제거
+        cleaned_lines = cleaned.splitlines()
+        if cleaned_lines and cleaned_lines[0].startswith("```"):
+            cleaned_lines = cleaned_lines[1:]
+        if cleaned_lines and cleaned_lines[-1].startswith("```"):
+            cleaned_lines = cleaned_lines[:-1]
+        cleaned = "\n".join(cleaned_lines).strip()
+    try:
+        parsed_json = json.loads(cleaned)
+    except Exception:
+        parsed_json = None
+
+    return {
+        "raw": text,
+        "parsed": parsed_json,
+    }
+
+
+# =========================
+# 유틸 함수들
+# =========================
+
+def save_upload_file_tmp(upload_file: UploadFile) -> str:
+    """업로드된 파일을 임시 경로에 저장하고 파일 경로 리턴"""
+    suffix = os.path.splitext(upload_file.filename or "")[1]
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    with os.fdopen(tmp_fd, "wb") as tmp:
+        shutil.copyfileobj(upload_file.file, tmp)
+    return tmp_path
+
+
+def cut_audio_segment(
+    input_path: str,
+    start: float,
+    end: float,
+    output_path: str,
+    sample_rate: int = 16000
+) -> None:
+    """
+    ffmpeg를 이용해 특정 구간만 잘라내기
+    - start, end: 초 단위
+    - mono, 16kHz로 리샘플링
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",  # 덮어쓰기
+        "-i", input_path,
+        "-ss", str(start),
+        "-to", str(end),
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-f", "wav",
+        output_path
+    ]
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg error: {result.stderr.decode('utf-8')}")
+
+
+def summarize_text(text: str, ratio: float = 0.2, max_sentences: int = 5) -> str:
+    """
+    TextRank 기반 추출 요약.
+    - 텍스트가 너무 짧으면 그냥 원문 리턴.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    # 대충 길이 기준으로 요약 시도 여부 판단 (필요하면 더 고급 로직으로 바꿔도 됨)
+    if len(text.split()) < 30:
+        return text
+
+    try:
+        summary = summarize(text, ratio=ratio)
+        if not summary:
+            return text
+
+        # 문장 수 제한
+        sentences = [s.strip() for s in summary.split("\n") if s.strip()]
+        if len(sentences) > max_sentences:
+            sentences = sentences[:max_sentences]
+        return " ".join(sentences)
+    except Exception:
+        # summa 내부 에러 시 그냥 원문 반환
+        return text
+
+
+def crawl_11st_by_category(category_no: str, limit: int = 6) -> List[Dict[str, Any]]:
+    """
+    최신 11번가 카테고리 페이지 크롤링 (2025 대응)
+    data-log-body 안의 JSON을 파싱해 상품 정보를 추출한다.
+    """
+    url = f"https://search.11st.co.kr/Search.tmall?ctgrNo={category_no}"
+    html = _fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    results = []
+
+    for tag in soup.find_all(attrs={"data-log-body": True}):
+        raw = tag.get("data-log-body")
+        data = _parse_json_attr(raw)
+        if not isinstance(data, dict):
+            continue
+
+        product_id = data.get("content_no") or data.get("productNo")
+        if not product_id:
+            continue
+
+        # redirect URL 추출
+        product_url = None
+        link_url = data.get("link_url")
+        if link_url and "redirect=" in link_url:
+            try:
+                parsed = urlparse(link_url)
+                qs = parse_qs(parsed.query)
+                product_url = qs.get("redirect", [None])[0]
+            except:
+                pass
+
+        if not product_url:
+            product_url = f"https://www.11st.co.kr/products/{product_id}"
+
+        name = (
+                data.get("productName")
+                or data.get("snippet_object", {}).get("name")
+                or ""
+        )
+        if not name:
+            continue
+
+        price = (
+                data.get("last_discount_price")
+                or data.get("productPrice")
+                or None
+        )
+        price = _clean_price(str(price)) if price else None
+
+        img_url = data.get("productImageUrl") or data.get("imageUrl")
+
+        delivery = data.get("snippet_object", {}).get("delivery_price")
+
+        results.append({
+            "productName": name,
+            "price": price,
+            "productUrl": product_url,
+            "imageUrl": img_url,
+            "source": "11번가",
+            "deliveryPrice": delivery,
+            "reason": "11번가 카테고리 data-log-body",
+        })
+
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+# =========================
+# 메인 분석 로직
+# =========================
+
+def run_diarization(audio_path: str) -> List[Dict[str, Any]]:
+    """
+    pyannote로 화자 분리 수행.
+    return 형식: [{"speaker": "SPEAKER_00", "start": 0.3, "end": 4.2}, ...]
+    """
+    diarization = diarization_pipeline(audio_path, AudioDecoder=AudioDecoder)
+
+    segments = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        segments.append({
+            "speaker": speaker,
+            "start": float(turn.start),
+            "end": float(turn.end),
+        })
+
+    return segments
+
+
+def transcribe_segment(audio_segment_path: str, language: str = "ko") -> str:
+    """
+    Whisper로 한 세그먼트에 대해 STT 수행.
+    """
+    text = ""
+    segments, _ = whisper_model.transcribe(
+        audio_segment_path,
+        language=language,
+        beam_size=5,
+        vad_filter=True
+    )
+    for seg in segments:
+        text += seg.text + " "
+    return text.strip()
+
+
+def process_audio_file(audio_path: str) -> Dict[str, Any]:
+    """
+    전체 파이프라인:
+    - diarization
+    - 각 화자별로 오디오 자르기 + STT
+    - 화자별 요약
+    - 전체 요약
+    """
+    diarization_segments = run_diarization(audio_path)
+
+    # 화자별 텍스트 모으기
+    speaker_texts: Dict[str, str] = {}
+    speaker_segments: Dict[str, List[Dict[str, float]]] = {}
+
+    for seg in diarization_segments:
+        speaker = seg["speaker"]
+        start = seg["start"]
+        end = seg["end"]
+
+        # 세그먼트 오디오 임시 파일로 자르기
+        seg_tmp_path = os.path.join(
+            tempfile.gettempdir(),
+            f"{uuid.uuid4().hex}.wav"
+        )
+        cut_audio_segment(audio_path, start, end, seg_tmp_path)
+
+        # Whisper로 텍스트 변환
+        try:
+            text = transcribe_segment(seg_tmp_path, language="ko")
+        finally:
+            # 임시 세그먼트 오디오 삭제
+            if os.path.exists(seg_tmp_path):
+                os.remove(seg_tmp_path)
+
+        if not text:
+            continue
+
+        speaker_texts.setdefault(speaker, "")
+        speaker_texts[speaker] += " " + text
+
+        speaker_segments.setdefault(speaker, [])
+        speaker_segments[speaker].append({"start": start, "end": end})
+
+    # 화자별 요약
+    speaker_summaries = {
+        speaker: summarize_text(text, ratio=0.2, max_sentences=5)
+        for speaker, text in speaker_texts.items()
+    }
+
+    # 전체 요약
+    full_text = " ".join(speaker_texts.values())
+    meeting_summary = summarize_text(full_text, ratio=0.15, max_sentences=7)
+
+    # 응답 구조로 정리
+    speakers_result = []
+    for speaker_id, full_text in speaker_texts.items():
+        speakers_result.append({
+            "id": speaker_id,
+            "summary": speaker_summaries.get(speaker_id, ""),
+            "full_text": full_text.strip(),
+            "segments": speaker_segments.get(speaker_id, [])
+        })
+
+    result = {
+        "speakers": speakers_result,
+        "meeting_summary": meeting_summary,
+    }
+    return result
+
+
+# =========================
+# 간단한 쇼핑 크롤러 (DeviceMart, 11번가)
+# =========================
+
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+}
+
+
+def _clean_price(text: str) -> Optional[int]:
+    digits = re.sub(r"[^0-9]", "", text)
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _fetch_html(url: str) -> str:
+    resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=10)
+    resp.raise_for_status()
+    return resp.text
+
+
+def _decode_json_string(value: str) -> str:
+    """HTML 내 JSON 블롭에서 추출한 문자열의 \\uXXXX 등을 디코드."""
+    try:
+        return _json_unescape.loads(f'"{value}"')
+    except Exception:
+        return value
+
+
+def _parse_json_attr(value: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(value)
+    except Exception:
+        try:
+            return _json_unescape.loads(value)
+        except Exception:
+            return None
+
+
+def _extract_11st_product_info_from_url(url: str) -> Dict[str, Optional[str]]:
+    info = {"product_id": None, "category": None}
+    parsed = urlparse(url)
+
+    # 1) productId 추출
+    m = re.search(r"/products/(\d+)", parsed.path)
+    if m:
+        info["product_id"] = m.group(1)
+
+    # 2) URL 쿼리에서 카테고리 먼저 확인 (최우선)
+    qs = parse_qs(parsed.query)
+    if "trCtgrNo" in qs and qs["trCtgrNo"]:
+        info["category"] = qs["trCtgrNo"][0]
+        return info
+
+    # 3) HTML fallback
+    try:
+        html = _fetch_html(url)
+    except Exception:
+        return info
+
+    cat_patterns = [
+        r'dispCtgrNo"\s*[:=]\s*"?(?P<num>\d+)',
+        r'ctgrNo"\s*[:=]\s*"?(?P<num>\d+)',
+        r'categoryNo"\s*[:=]\s*"?(?P<num>\d+)',
+    ]
+
+    for pat in cat_patterns:
+        mm = re.search(pat, html)
+        if mm:
+            info["category"] = mm.group("num")
+            break
+
+    return info
+
+
+
+def _fetch_11st_category_info(disp_ctgr_no: str) -> List[Dict[str, str]]:
+    """
+    11번가 카테고리 서비스로 하위 카테고리 정보를 조회.
+    """
+    url = f"http://api.11st.co.kr/rest/cateservice/category/{disp_ctgr_no}"
+    try:
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+    except Exception:
+        return []
+
+    categories: List[Dict[str, str]] = []
+    for cat in root.findall(".//{*}category"):
+        categories.append(
+            {
+                "depth": (cat.findtext("depth") or "").strip(),
+                "dispNm": (cat.findtext("dispNm") or "").strip(),
+                "dispNo": (cat.findtext("dispNo") or "").strip(),
+                "parentDispNo": (cat.findtext("parentDispNo") or "").strip(),
+            }
+        )
+    return categories
+
+
+def _is_relevant(name: str, query: str, *, min_matches: int = 2) -> bool:
+    """
+    간단한 토큰 기반 매칭: 검색어 토큰 일부가 상품명에 포함되면 관련성 있다고 판단.
+    - min_matches: 이 수만큼 토큰이 포함되어야 함 (기본 2개). 토큰이 1개뿐이면 1개 매칭만 요구.
+    """
+    name_lower = name.lower()
+    tokens = [t for t in re.split(r"[\s\-]+", query.lower()) if len(t) >= 2]
+    if not tokens:
+        return True
+    match_count = sum(1 for tok in tokens if tok in name_lower)
+    required = min(min_matches, len(tokens))
+    return match_count >= required
+
+
+def _dedupe_by_name(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
-    ordered: List[str] = []
-
-    for part in parts:
-        sentence = part.strip()
-        if not sentence:
+    deduped: List[Dict[str, Any]] = []
+    for item in items:
+        name = item.get("productName", "").strip()
+        if not name:
             continue
-        if len(sentence) < min_chars:
-            ordered.append(sentence)
-            continue
-        key = re.sub(r"\s+", " ", sentence).lower()
+        key = name.lower()
         if key in seen:
             continue
         seen.add(key)
-        ordered.append(sentence)
-
-    return " ".join(ordered).strip()
-
-
-def clean_summary_text(text: str) -> str:
-    """Apply token collapse and sentence deduplication."""
-    return deduplicate_sentences(collapse_repetitions(text))
+        deduped.append(item)
+    return deduped
 
 
-async def summarize_text(
-    text: str,
-    *,
-    max_length: int = 220,
-    min_length: int = 60,
-    num_beams: int = 4,
-    **generate_overrides,
-):
-    """Run KoBART summarization off the event loop with safer defaults."""
-    clean_text = text.strip()
-    if not clean_text:
-        return ""
+def crawl_devicemart(query: str, limit: int = 3) -> List[Dict[str, Any]]:
+    search_url = f"https://www.devicemart.co.kr/goods/search?searchword={quote_plus(query)}"
+    html = _fetch_html(search_url)
+    soup = BeautifulSoup(html, "html.parser")
 
-    clean_text = clean_summary_text(clean_text)
-
-    tokens = clean_text.split()
-    if len(tokens) < 5:
-        return clean_text
-
-    generate_params = dict(
-        max_length=max_length,
-        min_length=min_length,
-        num_beams=num_beams,
-        no_repeat_ngram_size=4,
-        repetition_penalty=1.4,
-        length_penalty=1.0,
-        early_stopping=True,
-    )
-    generate_params.update(generate_overrides)
-
-    def _generate():
-        with torch.no_grad():
-            inputs = encode_text(clean_text, max_length=1024)
-            summary_ids = model.generate(
-                **inputs,
-                **generate_params,
-            ).cpu()
-        return clean_summary_text(tokenizer.decode(summary_ids[0], skip_special_tokens=True))
-
-    return await asyncio.to_thread(_generate)
-
-
-def extract_input_text(payload: SummaryRequest) -> str:
-    """Return a normalized transcript string from raw text or speaker segments."""
-    if payload.text and payload.text.strip():
-        return payload.text.strip()
-
-    if payload.segments:
-        joined_lines = []
-        for segment in payload.segments:
-            content = (segment.text or "").strip()
-            if not content:
+    def _collect(min_matches: int) -> List[Dict[str, Any]]:
+        collected: List[Dict[str, Any]] = []
+        for card in soup.select("li"):
+            link_tag = card.find("a", href=re.compile(r"/goods/view"))
+            if not link_tag or not link_tag.get("href"):
                 continue
-            speaker = (segment.speaker or "").strip() or "발화자"
-            joined_lines.append(f"{speaker}: {content}")
-        return "\n".join(joined_lines).strip()
 
-    return ""
+            name = link_tag.get_text(" ", strip=True)
+            if not name:
+                continue
 
+            if not _is_relevant(name, query, min_matches=min_matches):
+                continue
 
-def segments_to_text(segments: List[SpeakerSegment]) -> str:
-    return "\n".join(f"{seg.speaker}: {seg.text}" for seg in segments if seg.text).strip()
+            price_tag = card.find("strong", class_=re.compile("price")) or card.find("span", class_=re.compile("price"))
+            price = _clean_price(price_tag.get_text(" ", strip=True)) if price_tag else None
+            img_tag = card.find("img")
+            img_url = urljoin("https://www.devicemart.co.kr", img_tag["src"]) if img_tag and img_tag.get("src") else None
+            # 카테고리/플레이스홀더 이미지는 건너뛴다.
+            if img_url and "/category/" in img_url:
+                img_url = None
 
-
-def diarize_with_pyannote(audio_path: str) -> List[tuple]:
-    try:
-        from pyannote.audio import Pipeline
-    except ImportError as exc:
-        raise RuntimeError("pyannote.audio 패키지가 설치되어 있지 않습니다.") from exc
-
-    token = os.environ.get("PYANNOTE_AUTH_TOKEN")
-    if not token:
-        raise RuntimeError("PYANNOTE_AUTH_TOKEN 환경 변수를 설정하세요.")
-    model_id = os.environ.get("PYANNOTE_MODEL_ID", "pyannote/speaker-diarization")
-    pipeline = Pipeline.from_pretrained(model_id, use_auth_token=token)
-    diarization = pipeline(audio_path)
-    intervals = [
-        (str(speaker), float(turn.start), float(turn.end))
-        for turn, _, speaker in diarization.itertracks(yield_label=True)
-    ]
-    return intervals
-
-
-def diarize_with_speechbrain(audio_path: str) -> List[tuple]:
-    try:
-        import numpy as np
-        import torchaudio
-        from speechbrain.pretrained import EncoderClassifier
-        from spectralcluster import SpectralClusterer
-    except ImportError as exc:
-        raise RuntimeError("speechbrain, torchaudio, spectralcluster 패키지를 설치하세요.") from exc
-
-    encoder_source = os.environ.get("SPEECHBRAIN_ENCODER", "speechbrain/spkrec-ecapa-voxceleb")
-    encoder_savedir = os.environ.get(
-        "SPEECHBRAIN_SAVEDIR",
-        os.path.join(tempfile.gettempdir(), "speechbrain_spkrec"),
-    )
-    chunk_seconds = float(os.environ.get("SPEECHBRAIN_CHUNK_SECONDS", "1.5"))
-    hop_ratio = float(os.environ.get("SPEECHBRAIN_HOP_RATIO", "0.5"))
-    target_sr = int(os.environ.get("SPEECHBRAIN_SAMPLE_RATE", "16000"))
-    try:
-        max_speakers = int(os.environ.get("DIARIZATION_MAX_SPEAKERS", "6"))
-    except ValueError:
-        max_speakers = 6
-
-    run_device = "cuda" if torch.cuda.is_available() else "cpu"
-    classifier = EncoderClassifier.from_hparams(
-        source=encoder_source,
-        savedir=encoder_savedir,
-        run_opts={"device": run_device},
-    )
-
-    waveform, sr = torchaudio.load(audio_path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    if sr != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-        sr = target_sr
-    signal = waveform.squeeze(0)
-
-    chunk_size = max(target_sr // 2, int(chunk_seconds * sr))
-    hop_size = max(1, int(chunk_size * hop_ratio))
-    if hop_size >= chunk_size:
-        hop_size = max(1, chunk_size // 2)
-
-    embeddings = []
-    windows = []
-    total_len = signal.shape[0]
-    if total_len <= chunk_size:
-        padded = F.pad(signal, (0, chunk_size - total_len))
-        chunk = padded.unsqueeze(0)
-        with torch.no_grad():
-            emb = classifier.encode_batch(chunk.to(run_device))
-        embeddings.append(emb.squeeze(0).cpu().numpy())
-        windows.append((0.0, chunk_size / sr))
-    else:
-        for start in range(0, total_len - chunk_size + 1, hop_size):
-            end = start + chunk_size
-            chunk = signal[start:end]
-            chunk = chunk.unsqueeze(0)
-            with torch.no_grad():
-                emb = classifier.encode_batch(chunk.to(run_device))
-            embeddings.append(emb.squeeze(0).cpu().numpy())
-            windows.append((start / sr, end / sr))
-        remainder = total_len % hop_size
-        if remainder and (total_len - chunk_size) > 0:
-            start = total_len - chunk_size
-            chunk = signal[start:]
-            if chunk.shape[0] < chunk_size:
-                chunk = F.pad(chunk, (0, chunk_size - chunk.shape[0]))
-            chunk = chunk.unsqueeze(0)
-            with torch.no_grad():
-                emb = classifier.encode_batch(chunk.to(run_device))
-            embeddings.append(emb.squeeze(0).cpu().numpy())
-            windows.append((start / sr, total_len / sr))
-
-    if not embeddings:
-        return []
-
-    embeddings = np.asarray(embeddings)
-    if embeddings.shape[0] == 1:
-        labels = np.array([0])
-    else:
-        try:
-            clusterer = SpectralClusterer(
-                min_clusters=1,
-                max_clusters=max(1, max_speakers),
-                p_percentile=0.90,
-                gaussian_blur_sigma=1,
+            collected.append(
+                {
+                    "productName": name,
+                    "price": price,
+                    "productUrl": urljoin("https://www.devicemart.co.kr", link_tag["href"]),
+                    "imageUrl": img_url,
+                    "source": "DeviceMart",
+                    "deliveryPrice": None,
+                    "estimatedDelivery": None,
+                    "reason": "크롤링 결과(디바이스마트) 상위 노출",
+                }
             )
-        except TypeError:
-            clusterer = SpectralClusterer(
-                min_clusters=1,
-                max_clusters=max(1, max_speakers),
+            if len(collected) >= limit:
+                break
+        return collected
+
+    results = _collect(min_matches=2)
+    if len(results) < limit:
+        results.extend(_collect(min_matches=1))
+        results = _dedupe_by_name(results)
+    return results[:limit]
+
+
+def crawl_11st(query: str, limit: int = 3, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    query = unquote(query).strip()
+    if query.startswith("http"):
+        info = _extract_11st_product_info_from_url(query)
+        category_no = info.get("category")
+        if category_no:
+            return crawl_11st_by_category(category_no, limit=limit)
+
+    # 🔥 반드시 있어야 하는 부분 — 너 코드에는 없음
+    search_url = f"https://search.11st.co.kr/Search.tmall?kwd={quote_plus(query)}"
+    html = _fetch_html(search_url)
+    soup = BeautifulSoup(html, "html.parser")
+
+
+    def _collect_from_cards(min_matches: Optional[int]) -> List[Dict[str, Any]]:
+        collected: List[Dict[str, Any]] = []
+        for card in soup.select("div.c_listing li, ul.c_listing li, div.listing ul li"):
+            link_tag = card.find("a", href=re.compile(r"11st\\.co\\.kr/products/"))
+            if not link_tag or not link_tag.get("href"):
+                continue
+
+            name = link_tag.get_text(" ", strip=True)
+            if not name:
+                continue
+
+            if min_matches is not None and not _is_relevant(name, query, min_matches=min_matches):
+                continue
+
+            price_tag = card.find("strong", class_=re.compile("price")) or card.find("span", class_=re.compile("price"))
+            price = _clean_price(price_tag.get_text(" ", strip=True)) if price_tag else None
+            if price is None:
+                price = _find_price_near(card)
+
+            img_tag = card.find("img")
+            img_url = None
+            if img_tag:
+                img_url = img_tag.get("data-original") or img_tag.get("data-src") or img_tag.get("src")
+            if img_url and img_url.startswith("//"):
+                img_url = "https:" + img_url
+
+            delivery_text = None
+            delivery_tag = card.find(string=re.compile("무료"))
+            if delivery_tag:
+                delivery_text = "무료배송"
+
+            collected.append(
+                {
+                    "productName": name,
+                    "price": price,
+                    "productUrl": link_tag["href"],
+                    "imageUrl": img_url,
+                    "source": "11번가",
+                    "deliveryPrice": delivery_text,
+                    "estimatedDelivery": None,
+                    "reason": "크롤링 결과(11번가) 상위 노출",
+                }
             )
-        labels = clusterer.predict(embeddings)
+            if len(collected) >= limit:
+                break
+        return collected
 
-    intervals: List[tuple] = []
-    current_label = None
-    current_start = None
-    current_end = None
-    for label, window in zip(labels, windows):
-        start, end = window
-        if current_label is None:
-            current_label = label
-            current_start = start
-            current_end = end
-            continue
-        if label != current_label:
-            intervals.append((f"화자{int(current_label) + 1}", current_start, current_end))
-            current_label = label
-            current_start = start
-            current_end = end
-        else:
-            current_end = end
+    def _collect_from_links(min_matches: Optional[int]) -> List[Dict[str, Any]]:
+        """
+        카드 셀렉터가 깨졌을 때 대비: 페이지 내 모든 product 링크를 훑으며 수집.
+        """
+        collected: List[Dict[str, Any]] = []
+        seen_links = set()
+        for link_tag in soup.find_all("a", href=re.compile(r"11st\\.co\\.kr/products/")):
+            href = link_tag.get("href")
+            if not href or href in seen_links:
+                continue
+            seen_links.add(href)
 
-    if current_label is not None and current_start is not None and current_end is not None:
-        intervals.append((f"화자{int(current_label) + 1}", current_start, current_end))
+            name = link_tag.get_text(" ", strip=True)
+            if not name:
+                continue
 
-    return intervals
+            if min_matches is not None and not _is_relevant(name, query, min_matches=min_matches):
+                continue
 
+            parent = link_tag.find_parent(["li", "div"]) or link_tag
+            price = _find_price_near(parent)
 
-def diarize_with_resemblyzer(audio_path: str, max_speakers: int) -> List[tuple]:
-    try:
-        import numpy as np
-        from resemblyzer import VoiceEncoder, preprocess_wav
-        from resemblyzer.hparams import sampling_rate
-        from spectralcluster import SpectralClusterer
-    except ImportError as exc:
-        raise RuntimeError("resemblyzer 또는 spectralcluster 패키지가 없습니다.") from exc
+            img_url = None
+            img_tag = parent.find("img")
+            if img_tag:
+                img_url = img_tag.get("data-original") or img_tag.get("data-src") or img_tag.get("src")
+            if img_url and img_url.startswith("//"):
+                img_url = "https:" + img_url
 
-    wav = preprocess_wav(audio_path)
-    encoder = VoiceEncoder()
-    _, partial_embeddings, wav_slices = encoder.embed_utterance(
-        wav,
-        return_partials=True,
-        rate=16,
-    )
-
-    if len(partial_embeddings) == 0:
-        return []
-
-    partial_embeddings = np.asarray(partial_embeddings)
-    if partial_embeddings.shape[0] == 1:
-        labels = np.array([0])
-    else:
-        try:
-            clusterer = SpectralClusterer(
-                min_clusters=1,
-                max_clusters=max(1, max_speakers),
-                p_percentile=0.90,
-                gaussian_blur_sigma=1,
+            collected.append(
+                {
+                    "productName": name,
+                    "price": price,
+                    "productUrl": href,
+                    "imageUrl": img_url,
+                    "source": "11번가",
+                    "deliveryPrice": None,
+                    "estimatedDelivery": None,
+                    "reason": "크롤링 결과(11번가) 링크 파싱",
+                }
             )
-        except TypeError:
-            clusterer = SpectralClusterer(
-                min_clusters=1,
-                max_clusters=max(1, max_speakers),
-            )
-        labels = clusterer.predict(partial_embeddings)
+            if len(collected) >= limit:
+                break
+        return collected
 
-    intervals: List[tuple] = []
-    current_label = None
-    current_start = 0.0
-    current_end = 0.0
-
-    for label, slice_window in zip(labels, wav_slices):
-        start_idx = getattr(slice_window, "start", 0)
-        end_idx = getattr(slice_window, "stop", start_idx)
-        start_time = start_idx / sampling_rate
-        end_time = end_idx / sampling_rate
-        if current_label is None:
-            current_label = label
-            current_start = start_time
-            current_end = end_time
-            continue
-        if label != current_label:
-            intervals.append((f"화자{int(current_label) + 1}", current_start, current_end))
-            current_label = label
-            current_start = start_time
-            current_end = end_time
-        else:
-            current_end = end_time
-
-    if current_label is not None:
-        intervals.append((f"화자{int(current_label) + 1}", current_start, current_end))
-
-    return intervals
-
-
-async def summarize_segments(segments: List[SpeakerSegment]) -> str:
-    transcript_text = collapse_repetitions(segments_to_text(segments))
-    summary = await summarize_text(transcript_text)
-    if is_repetitive(summary):
-        summary = await summarize_text(
-            transcript_text,
-            num_beams=1,
-            no_repeat_ngram_size=6,
-            repetition_penalty=1.8,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.9,
+    def _collect_from_json_blob() -> List[Dict[str, Any]]:
+        """
+        HTML 내 스크립트 JSON에서 product 정보를 정규식으로 추출.
+        """
+        collected: List[Dict[str, Any]] = []
+        pattern = re.compile(
+            r'"productname"\\s*:\\s*"(?P<name>[^"]+?)".*?"productid"\\s*:\\s*"?(?P<pid>\\d+)"?.*?"productprice"\\s*:\\s*"?(?P<price>\\d+)"?.*?"productimage"\\s*:\\s*"(?P<img>[^"]+?)"',
+            re.DOTALL | re.IGNORECASE,
         )
-    if is_repetitive(summary):
-        summary = clean_summary_text(transcript_text[:500])
-    return summary
-
-
-def guess_media_format(path: str) -> str:
-    ext = Path(path).suffix.lstrip(".").lower()
-    return ext or "wav"
-
-
-async def transcribe_audio(provider: ProviderType, audio_bytes: bytes, audio_path: str) -> List[SpeakerSegment]:
-    if provider == ProviderType.google:
-        return await asyncio.to_thread(transcribe_with_google, audio_bytes)
-    if provider == ProviderType.aws:
-        media_format = guess_media_format(audio_path)
-        return await asyncio.to_thread(transcribe_with_aws, audio_path, media_format)
-    if provider == ProviderType.azure:
-        return await asyncio.to_thread(transcribe_with_azure, audio_path)
-    if provider == ProviderType.whisper:
-        return await asyncio.to_thread(transcribe_with_whisper_resemblyzer, audio_path)
-    raise RuntimeError(f"Unsupported provider: {provider}")
-
-
-def transcribe_with_google(audio_bytes: bytes, language_code: str = "ko-KR") -> List[SpeakerSegment]:
-    try:
-        from google.cloud import speech
-    except ImportError as exc:
-        raise RuntimeError("google-cloud-speech 패키지가 설치되어 있지 않습니다.") from exc
-
-    client = speech.SpeechClient()
-    diarization_config = speech.SpeakerDiarizationConfig(
-        enable_speaker_diarization=True,
-        min_speaker_count=2,
-        max_speaker_count=6,
-    )
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
-        language_code=language_code,
-        model="latest_long",
-        enable_word_time_offsets=True,
-        diarization_config=diarization_config,
-    )
-    audio = speech.RecognitionAudio(content=audio_bytes)
-    response = client.recognize(config=config, audio=audio)
-    if not response.results:
-        return []
-
-    words = response.results[-1].alternatives[0].words
-    segments: List[SpeakerSegment] = []
-    current_tag = None
-    current_words: List[str] = []
-    start_time = 0.0
-    end_time = 0.0
-
-    for word in words:
-        tag = word.speaker_tag or 0
-        word_text = word.word
-        if current_tag is None:
-            current_tag = tag
-            start_time = word.start_time.total_seconds()
-        elif tag != current_tag:
-            text = " ".join(current_words).strip()
-            if text:
-                segments.append(
-                    SpeakerSegment(
-                        speaker=f"화자{current_tag}",
-                        text=text,
-                        start=start_time,
-                        end=word.start_time.total_seconds(),
-                    )
-                )
-            current_words = []
-            current_tag = tag
-            start_time = word.start_time.total_seconds()
-        current_words.append(word_text)
-        end_time = word.end_time.total_seconds()
-
-    if current_words:
-        segments.append(
-            SpeakerSegment(
-                speaker=f"화자{current_tag}",
-                text=" ".join(current_words).strip(),
-                start=start_time,
-                end=end_time,
+        for m in pattern.finditer(html):
+            name_raw = m.group("name")
+            pid = m.group("pid")
+            price_val = _clean_price(m.group("price"))
+            img_url = m.group("img")
+            name = _decode_json_string(name_raw)
+            if not name:
+                continue
+            collected.append(
+                {
+                    "productName": name,
+                    "price": price_val,
+                    "productUrl": f"https://www.11st.co.kr/products/{pid}",
+                    "imageUrl": img_url,
+                    "source": "11번가",
+                    "deliveryPrice": None,
+                    "estimatedDelivery": None,
+                    "reason": "크롤링 결과(11번가) JSON 파싱",
+                }
             )
-        )
+            if len(collected) >= limit:
+                break
+        return collected
 
-    return segments
+    def _collect_from_data_log_body() -> List[Dict[str, Any]]:
+        collected = []
+
+        for tag in soup.find_all(attrs={"data-log-body": True}):
+            raw = tag.get("data-log-body")
+            data = _parse_json_attr(raw)
+            if not isinstance(data, dict):
+                continue
+
+            product_id = data.get("content_no") or data.get("productNo")
+            if not product_id:
+                continue
+
+            # 광고 redirect URL에서 진짜 상품URL 추출
+            link_url = data.get("link_url")
+            product_url = None
+            if link_url and "redirect=" in link_url:
+                try:
+                    parsed = urlparse(link_url)
+                    qs = parse_qs(parsed.query)
+                    product_url = qs.get("redirect", [None])[0]
+                except:
+                    pass
+
+            if not product_url:
+                product_url = f"https://www.11st.co.kr/products/{product_id}"
+
+            # 상품명
+            name = data.get("productName") or data.get("snippet_object", {}).get("name") or ""
+            if not name:
+                continue
+
+            # 가격
+            price = data.get("last_discount_price") or data.get("productPrice")
+            price = _clean_price(str(price)) if price else None
+
+            # 이미지
+            img_url = data.get("productImageUrl") or data.get("imageUrl")
+
+            # 배송비
+            delivery = data.get("snippet_object", {}).get("delivery_price")
+
+            collected.append({
+                "productName": name,
+                "price": price,
+                "productUrl": product_url,
+                "imageUrl": img_url,
+                "source": "11번가",
+                "deliveryPrice": delivery,
+                "reason": "11번가 data-log-body JSON",
+            })
+
+            if len(collected) >= limit:
+                break
+
+        return collected
 
 
-def transcribe_with_aws(audio_path: str, media_format: str, language_code: str = "ko-KR") -> List[SpeakerSegment]:
+def crawl_products(query: str, limit_total: int = 6, sources: Optional[List[str]] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    검색어로 각 쇼핑몰을 크롤링.
+    - sources: ["devicemart", "11st"] 중 선택. None이면 둘 다.
+    """
+    normalized = [s.lower() for s in sources] if sources else ["devicemart", "11st"]
+    items: List[Dict[str, Any]] = []
+
+    crawlers: List = []
+    if any(s in normalized for s in ("devicemart", "device", "dm")):
+        crawlers.append(crawl_devicemart)
+    if any(s in normalized for s in ("11st", "11번가", "eleven")):
+        crawlers.append(crawl_11st)
+    if not crawlers:
+        crawlers = [crawl_devicemart, crawl_11st]
+
+    per_site = max(1, limit_total // max(1, len(crawlers)))
+
+    for crawler in crawlers:
+        try:
+            if crawler is crawl_11st:
+                items.extend(crawler(query, limit=per_site, category=category))
+            else:
+                items.extend(crawler(query, limit=per_site))
+        except Exception as e:
+            # 크롤링 실패 시 다른 사이트라도 계속 시도
+            print(f"[crawler] {crawler.__name__} failed: {e}")
+
+    items = _dedupe_by_name(items)
+    return items[:limit_total]
+
+
+# =========================
+# FastAPI 엔드포인트
+# =========================
+
+
+@app.post("/recommendations/prompt")
+async def recommendation_prompt(payload: RecommendationRequest):
+    """
+    기준 상품 + 후보 목록을 받아 Gemini에 전달할 system/user 프롬프트와 응답 스키마 예시를 반환,
+    동시에 Gemini를 호출해 결과를 함께 제공.
+    """
+    prompts = build_recommendation_prompt(payload.base_item, payload.candidates)
     try:
-        import boto3
-        import requests
-    except ImportError as exc:
-        raise RuntimeError("boto3 또는 requests 패키지가 설치되어 있지 않습니다.") from exc
-
-    bucket = os.environ.get("AWS_TRANSCRIBE_BUCKET")
-    if not bucket:
-        raise RuntimeError("AWS_TRANSCRIBE_BUCKET 환경 변수를 설정하세요.")
-
-    s3 = boto3.client("s3")
-    key = f"transcribe/{uuid.uuid4().hex}{Path(audio_path).suffix}"
-    s3.upload_file(audio_path, bucket, key)
-
-    transcribe = boto3.client("transcribe")
-    job_name = f"job-{uuid.uuid4().hex}"
-    media_uri = f"s3://{bucket}/{key}"
-
-    transcribe.start_transcription_job(
-        TranscriptionJobName=job_name,
-        Media={"MediaFileUri": media_uri},
-        MediaFormat=media_format,
-        LanguageCode=language_code,
-        Settings={
-            "ShowSpeakerLabels": True,
-            "MaxSpeakerLabels": 6,
-        },
-    )
-
-    while True:
-        job = transcribe.get_transcription_job(TranscriptionJobName=job_name)["TranscriptionJob"]
-        status = job["TranscriptionJobStatus"]
-        if status in ("COMPLETED", "FAILED"):
-            break
-        time.sleep(5)
-
-    if status == "FAILED":
-        raise RuntimeError(job.get("FailureReason", "AWS Transcribe 실패"))
-
-    transcript_uri = job["Transcript"]["TranscriptFileUri"]
-    response = requests.get(transcript_uri, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-
-    speaker_segments = payload.get("results", {}).get("speaker_labels", {}).get("segments", [])
-    items = payload.get("results", {}).get("items", [])
-
-    speaker_map = {}
-    for segment in speaker_segments:
-        speaker = segment.get("speaker_label", "화자?")
-        for item in segment.get("items", []):
-            start_time = item.get("start_time")
-            if start_time:
-                speaker_map[start_time] = speaker
-
-    segments: List[SpeakerSegment] = []
-    current_speaker = None
-    current_words: List[str] = []
-    start_time = None
-    end_time = None
-
-    for item in items:
-        if item.get("type") != "pronunciation":
-            continue
-        start = item.get("start_time")
-        end = item.get("end_time")
-        word = item.get("alternatives", [{}])[0].get("content", "")
-        speaker = speaker_map.get(start, "화자?")
-
-        if current_speaker is None:
-            current_speaker = speaker
-            start_time = float(start)
-        elif speaker != current_speaker:
-            text = " ".join(current_words).strip()
-            if text:
-                segments.append(
-                    SpeakerSegment(
-                        speaker=current_speaker,
-                        text=text,
-                        start=start_time,
-                        end=float(start),
-                    )
-                )
-            current_words = []
-            current_speaker = speaker
-            start_time = float(start)
-
-        current_words.append(word)
-        end_time = float(end)
-
-    if current_words:
-        segments.append(
-            SpeakerSegment(
-                speaker=current_speaker or "화자?",
-                text=" ".join(current_words).strip(),
-                start=start_time,
-                end=end_time,
+        gemini_result = call_gemini(prompts["system_prompt"], prompts["user_prompt"])
+        return JSONResponse(
+            content={
+                **prompts,
+                "gemini_raw": gemini_result["raw"],
+                "gemini_parsed": gemini_result["parsed"],
+            }
+        )
+    except HTTPException as e:
+        # 429 등 LLM 호출 실패 시에도 프롬프트는 내려서 프런트가 직접 호출하거나 재시도 가능하도록 한다.
+        if e.status_code == 429:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    **prompts,
+                    "gemini_raw": None,
+                    "gemini_parsed": None,
+                    "gemini_error": "Gemini 호출이 제한되었습니다. 프런트에서 직접 호출하거나 잠시 후 재시도하세요.",
+                },
             )
-        )
-
-    return segments
+        raise
 
 
-def transcribe_with_azure(audio_path: str, language_code: str = "ko-KR") -> List[SpeakerSegment]:
-    try:
-        import azure.cognitiveservices.speech as speechsdk
-    except ImportError as exc:
-        raise RuntimeError("azure-cognitiveservices-speech 패키지가 없습니다.") from exc
+@app.post("/analyze")
+async def analyze_meeting_audio(file: UploadFile = File(...)):
+    """
+    회의 음성 파일 업로드 → 화자별 요약 + 전체 요약 반환
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="파일 이름이 없습니다.")
 
-    speech_key = os.environ.get("AZURE_SPEECH_KEY")
-    region = os.environ.get("AZURE_SPEECH_REGION")
-    if not speech_key or not region:
-        raise RuntimeError("AZURE_SPEECH_KEY / AZURE_SPEECH_REGION 환경 변수를 설정하세요.")
+    # 간단한 확장자 체크 (원하면 더 강화 가능)
+    if not (file.filename.endswith(".wav") or file.filename.endswith(".mp3") or file.filename.endswith(".m4a")):
+        raise HTTPException(status_code=400, detail="wav/mp3/m4a 형식만 지원합니다.")
 
-    speech_config = speechsdk.SpeechConfig(subscription=speech_key, region=region)
-    speech_config.speech_recognition_language = language_code
-    speech_config.set_service_property(
-        name="diarizationEnabled",
-        value="true",
-        channel=speechsdk.ServicePropertyChannel.UriQueryParameter,
-    )
-    speech_config.set_property(
-        speechsdk.PropertyId.SpeechServiceResponse_RequestWordLevelTimestamps, "true"
-    )
-
-    audio_config = speechsdk.audio.AudioConfig(filename=audio_path)
-    transcriber = speechsdk.transcription.ConversationTranscriber(
-        speech_config=speech_config,
-        audio_config=audio_config,
-    )
-
-    segments: List[SpeakerSegment] = []
-    done = threading.Event()
-
-    def handle_transcribed(evt):
-        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
-            speaker_id = evt.result.speaker_id or f"화자{evt.result.channel_id}"
-            text = evt.result.text.strip()
-            if text:
-                segments.append(SpeakerSegment(speaker=speaker_id, text=text))
-
-    def stop_handler(_):
-        done.set()
-
-    transcriber.transcribed.connect(handle_transcribed)
-    transcriber.canceled.connect(stop_handler)
-    transcriber.session_stopped.connect(stop_handler)
-
-    transcriber.start_transcribing_async().get()
-    done.wait()
-    transcriber.stop_transcribing_async().get()
-
-    return segments
-
-
-def transcribe_with_whisper_resemblyzer(audio_path: str) -> List[SpeakerSegment]:
-    try:
-        import whisper
-    except ImportError as exc:
-        raise RuntimeError("whisper 패키지가 설치되어 있지 않습니다.") from exc
-
-    whisper_model_name = os.environ.get("WHISPER_MODEL_NAME", "small")
-    try:
-        max_speakers = int(os.environ.get("DIARIZATION_MAX_SPEAKERS", "6"))
-    except ValueError:
-        max_speakers = 6
-
-    whisper_model = whisper.load_model(whisper_model_name)
-    whisper_result = whisper_model.transcribe(
-        audio_path,
-        language="ko",
-        word_timestamps=True,
-        verbose=False,
-    )
-
-    words = extract_word_units(whisper_result)
-    segments: List[SpeakerSegment] = []
-    intervals: List[tuple] = []
+    tmp_path = save_upload_file_tmp(file)
 
     try:
-        intervals = diarize_with_speechbrain(audio_path)
-    except Exception as exc:
-        logger.warning("SpeechBrain diarization 실패: %s", exc)
-
-    if not intervals and os.environ.get("PYANNOTE_AUTH_TOKEN"):
-        try:
-            intervals = diarize_with_pyannote(audio_path)
-        except Exception as exc:
-            logger.warning("pyannote diarization 실패: %s", exc)
-
-    if not intervals:
-        try:
-            intervals = diarize_with_resemblyzer(audio_path, max_speakers)
-        except Exception as exc:
-            logger.warning("Resemblyzer diarization 실패: %s", exc)
-
-    if intervals:
-        segments = build_segments_from_intervals(words, intervals)
-
-    if not segments:
-        summary_text = whisper_result.get("text", "").strip()
-        if summary_text:
-            segments.append(SpeakerSegment(speaker="전체", text=summary_text))
-
-    return segments
-
-
-@app.post("/summarize", response_model=SummaryResponse)
-async def summarize_endpoint(payload: SummaryRequest):
-    clean_full_text = clean_summary_text(extract_input_text(payload))
-    if not clean_full_text:
-        raise HTTPException(status_code=400, detail="요약할 텍스트를 입력해주세요.")
-
-    summary = await summarize_text(clean_full_text)
-    if is_repetitive(summary):
-        summary = await summarize_text(
-            clean_full_text,
-            num_beams=1,
-            no_repeat_ngram_size=6,
-            repetition_penalty=1.8,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.9,
-        )
-    if is_repetitive(summary):
-        summary = clean_summary_text(clean_full_text[:500])
-
-    return SummaryResponse(summary=summary)
-
-
-@app.post("/transcribe-and-summarize", response_model=TranscriptionResponse)
-async def transcribe_and_summarize(provider: ProviderType = Form(...), audio: UploadFile = File(...)):
-    audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(status_code=400, detail="오디오 파일이 비어 있습니다.")
-
-    suffix = Path(audio.filename or "audio.wav").suffix or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-
-    try:
-        segments = await transcribe_audio(provider, audio_bytes, tmp_path)
-    except Exception as exc:
-        logger.exception("Transcription failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"{provider.value} 음성 인식 실패: {exc}") from exc
+        result = process_audio_file(tmp_path)
+        return JSONResponse(content=result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            logger.warning("임시 파일 삭제 실패: %s", tmp_path)
+        # 원본 임시 파일 삭제
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-    if not segments:
-        raise HTTPException(status_code=500, detail="음성을 텍스트로 변환하지 못했습니다.")
+# pyannote 3.3.x에서 AudioDecoder 심볼 누락 시 diarization_pipeline 호출에 넘겨주기 위한 fallback
+from fastapi import Request
 
-    summary = await summarize_segments(segments)
-    return TranscriptionResponse(provider=provider, segments=segments, summary=summary)
+
+@app.post("/debug/pyannote")
+async def debug_pyannote(request: Request):
+    """
+    pyannote AudioDecoder가 import 가능한지 확인용 간단 엔드포인트
+    """
+    ok = AudioDecoder is not None
+    return {"AudioDecoder_present": ok}
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+
+@app.get("/recommendations/crawl")
+async def crawl_recommendations(q: str, limit: int = 6, source: Optional[str] = None, category: Optional[str] = None):
+    """
+    Gemini 없이 간단히 검색어 기반 크롤링으로 상위 상품을 수집해 반환한다.
+    - q: 검색어 (예: 기준 상품명)
+    - limit: 최대 결과 수
+    - source: "devicemart" 또는 "11st" 중 선택 (None이면 둘 다)
+    - category: 11번가 카테고리 번호. q가 11번가 상품 URL이면 trCtgrNo를 자동 추출해 사용한다.
+    """
+    limit = max(1, min(10, limit))
+    sources = [source] if source else None
+    items = crawl_products(q, limit_total=limit, sources=sources, category=category)
+
+    return JSONResponse(
+        content={
+            "query": q,
+            "source": source or "all",
+            "category": category,
+            "count": len(items),
+            "items": items,
+            "note": "검색 결과가 없으면 빈 배열을 반환합니다.",
+            "debug": {
+                "devicemart_enabled": not source or source.lower() in ("devicemart", "device", "dm"),
+                "eleven_enabled": not source or source.lower() in ("11st", "11번가", "eleven"),
+            },
+        },
+        status_code=200,
+    )
+import requests
+import xml.etree.ElementTree as ET
+from fastapi import FastAPI, Query
+from keybert import KeyBERT
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("jhgan/ko-sroberta-multitask")
+kw_model = KeyBERT(model)
+
+def extract_main_keyword(text: str) -> str:
+    keywords = kw_model.extract_keywords(
+        text,
+        keyphrase_ngram_range=(1, 2),
+        stop_words=None,
+        top_n=10
+    )
+    return keywords[0][0]
+
+API_KEY = "ff49fbaa914833d531a36ada7b3c3ac0"
+
+
+
+def search_11st_products(keyword: str, limit: int = 20):
+    url = "http://openapi.11st.co.kr/openapi/OpenApiService.tmall"
+    params = {
+        "key": API_KEY,
+        "apiCode": "ProductSearch",
+        "keyword": keyword,
+        "pageSize": limit,
+        "sortCd": "CP"
+    }
+
+    xml_response = requests.get(url, params=params).text
+    return parse_product_xml(xml_response)
+
+
+def parse_product_xml(xml_data: str):
+    root = ET.fromstring(xml_data)
+    products = root.find("Products")
+
+    if products is None:
+        return []
+
+    result = []
+    for product in products.findall("Product"):
+        def get(tag):
+            e = product.find(tag)
+            return e.text if e is not None else None
+
+        result.append({
+            "productCode": get("ProductCode"),
+            "name": get("ProductName"),
+            "price": get("ProductPrice"),
+            "image": get("ProductImage300") or get("ProductImage"),
+            "detailUrl": get("DetailPageUrl"),
+            "seller": get("SellerNick"),
+        })
+
+    return result
+
+
+@app.get("/recommend/11st")
+def recommend_from_name(
+    name: str = Query(..., description="상품명 그대로 입력"),
+    limit: int = 20
+):
+    keyword = extract_main_keyword(name)
+    print(" ⬇️ 추출된 핵심 키워드:", keyword)
+
+    items = search_11st_products(keyword, limit)
+
+    return {
+        "query": name,
+        "keyword": keyword,
+        "count": len(items),
+        "items": items
+    }
