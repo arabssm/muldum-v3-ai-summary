@@ -8,6 +8,8 @@ faster-whisper==1.2.1
 pyannote-audio==4.0.1
 torchaudio==2.9.0
 torch==2.9.0
+speechbrain==1.0.3
 soundfile==0.13.1
 ffmpeg-python==0.2.0
 summa==1.2.0
+speechbrain==1.0.3
